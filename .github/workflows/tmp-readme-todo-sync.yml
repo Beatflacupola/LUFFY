@@ -1,0 +1,159 @@
+name: Temporary README TODO sync
+
+on:
+  push:
+    branches:
+      - tmp/readme-todo-sync
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-readme-todos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Sync README TODO entries for main-to-dev Python changes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import io
+          import re
+          import subprocess
+          import tokenize
+          from pathlib import Path
+
+          root = Path('.')
+          readme_path = root / 'README.md'
+          text = readme_path.read_text(encoding='utf-8')
+          ends_with_newline = text.endswith('\n')
+          lines = text.splitlines()
+
+          heading = '### 📝 Complete TODO List'
+          heading_indices = [i for i, line in enumerate(lines) if line.strip() == heading]
+          assert len(heading_indices) == 1, f'Expected one TODO heading, found {heading_indices}'
+          heading_index = heading_indices[0]
+          section_end = next(
+              (i for i in range(heading_index + 1, len(lines)) if lines[i].startswith('## ')),
+              len(lines),
+          )
+
+          entry_re = re.compile(
+              r'^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<desc>.*)$'
+          )
+
+          def extract_todos(file_path):
+              source = Path(file_path).read_text(encoding='utf-8')
+              todos = []
+              tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+              for token in tokens:
+                  if token.type != tokenize.COMMENT or 'TODO' not in token.string:
+                      continue
+                  body = token.string[token.string.find('TODO'):]
+                  body = re.sub(r'^TODO\s*', '', body)
+                  body = re.sub(r'^\s*:\s*', '', body)
+                  description = ' '.join(body.split())
+                  todos.append((token.start[0], description))
+              return todos
+
+          all_py_files = sorted(
+              path for path in root.rglob('*.py') if '.git' not in path.parts
+          )
+          all_todo_count = sum(len(extract_todos(path)) for path in all_py_files)
+          print(f'Scanned {len(all_py_files)} Python files containing {all_todo_count} TODO comments.')
+
+          changed_output = subprocess.check_output(
+              ['git', 'diff', '--name-only', 'main...HEAD', '--', '*.py'],
+              text=True,
+          )
+          changed_py_files = [item.strip() for item in changed_output.splitlines() if item.strip()]
+          print('Python files changed from main to dev:', changed_py_files)
+
+          groups = []
+          current = None
+          for index in range(heading_index + 1, section_end):
+              match = entry_re.match(lines[index])
+              if not match:
+                  continue
+              path = match.group('path')
+              if (
+                  current is not None
+                  and current['path'] == path
+                  and current['end'] == index - 1
+              ):
+                  current['end'] = index
+              else:
+                  if current is not None:
+                      groups.append(current)
+                  current = {'path': path, 'start': index, 'end': index}
+          if current is not None:
+              groups.append(current)
+
+          group_by_path = {}
+          for group in groups:
+              assert group['path'] not in group_by_path, f"Duplicate group for {group['path']}"
+              group_by_path[group['path']] = group
+
+          replacements = []
+          for path in changed_py_files:
+              todos = extract_todos(path)
+              replacement_lines = [
+                  f'- [ ] **{path}:{line_number}** - {description}'
+                  for line_number, description in todos
+              ]
+              if path not in group_by_path:
+                  raise RuntimeError(
+                      f'{path} has no existing README group; insertion ordering is not configured'
+                  )
+              group = group_by_path[path]
+              print(
+                  f"Sync {path}: README lines {group['start'] + 1}-{group['end'] + 1} "
+                  f"-> {len(replacement_lines)} current TODO entries."
+              )
+              replacements.append((group['start'], group['end'], replacement_lines))
+
+          for start, end, replacement_lines in sorted(replacements, reverse=True):
+              lines[start:end + 1] = replacement_lines
+
+          # Validate ordering and line numbers within each changed path block.
+          for path in changed_py_files:
+              path_entries = []
+              for index in range(heading_index + 1, len(lines)):
+                  if index < len(lines) and lines[index].startswith('## '):
+                      break
+                  match = entry_re.match(lines[index])
+                  if match and match.group('path') == path:
+                      path_entries.append(int(match.group('line')))
+              assert path_entries == sorted(path_entries), (path, path_entries)
+              assert len(path_entries) == len(set(path_entries)), (path, path_entries)
+
+          updated_text = '\n'.join(lines)
+          if ends_with_newline:
+              updated_text += '\n'
+          readme_path.write_text(updated_text, encoding='utf-8')
+          PY
+
+      - name: Show README diff
+        shell: bash
+        run: |
+          git diff -- README.md | sed -n '1,240p'
+
+      - name: Commit and push README update
+        shell: bash
+        run: |
+          if git diff --quiet -- README.md; then
+            echo "README.md is already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: sync complete TODO list with dev changes"
+          git push origin HEAD:dev
